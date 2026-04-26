@@ -1,0 +1,6 @@
+.env
+*_preview_*.txt
+processed_uids.json
+__pycache__/
+*.pyc
+.claude/
