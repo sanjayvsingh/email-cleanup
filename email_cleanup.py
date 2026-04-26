@@ -613,6 +613,7 @@ def main():
     # Start background classifier
     result_queue = queue.Queue()
     client = genai.Client(api_key=api_key)
+    quiet = threading.Event()
 
     if pass2_candidates:
         print('Pass 2: Starting AI classification in background...\n')
@@ -632,7 +633,6 @@ def main():
     worker_done = not bool(pass2_candidates)
     total_deleted = 0
     last_item_time = time.time()
-    quiet = threading.Event()
 
     while pass1_idx < len(pass1_flagged) or not worker_done:
         chunk = []
