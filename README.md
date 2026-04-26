@@ -44,12 +44,12 @@ python3 email_cleanup.py --list-folders
 |---|---|
 | `folder` | IMAP folder to scan (required) |
 | `--limit N` | Max unprocessed emails to fetch (default: 100) |
-| `--list-folders` | Print all available IMAP folders and exit |
+| `--list-folders` | Print all available IMAP folders and message counts, then exit |
 
 ### Examples
 
 ```bash
-# See available folders
+# See available folders with message counts
 python3 email_cleanup.py --list-folders
 
 # Test run — 100 oldest unprocessed emails from trash
@@ -68,22 +68,27 @@ python3 email_cleanup.py INBOX --limit 20000
 Instantly flags emails where the sender address starts with `marketing`, `deals`, `offers`, or `promotions`, or where the subject contains opt-out boilerplate like "unsubscribe" or "manage your preferences".
 
 **Pass 2 — AI classification (Gemini API)**
-Remaining emails are sent to Gemini in batches of 10. Each email is classified as:
-- `MARKETING` — promotional, newsletters, shipping notifications, review requests
-- `SPAM` — phishing, scams, fraud
-- `KEEP` — personal correspondence, order confirmations with receipts, security alerts
+Remaining emails are classified in the background in batches of 10. Each email is classified as:
+- `MARKETING` — promotional emails, newsletters, shipping notifications, review/feedback requests
+- `SPAM` — phishing, scams, fraud, impersonation
+- `KEEP` — personal correspondence, order confirmations with receipts, security alerts, password resets
 
 When uncertain, the AI defaults to `KEEP`.
 
-**Preview & confirm**
-Before anything is deleted, a timestamped report is saved (`email_cleanup_preview_YYYYMMDD_HHMMSS.txt`) and a summary is printed. You must type `yes` to proceed.
+**Interactive chunk-by-chunk review**
+Results are presented in chunks of 1,000 emails as they become available. For each chunk:
+- A timestamped report is saved (`email_cleanup_preview_YYYYMMDD_HHMMSS_chunk{N}.txt`)
+- A summary is printed showing keyword-flagged, AI marketing, and AI spam counts
+- You type `yes`, `no`, or `quit` to delete, skip, or stop
+
+The AI classifier runs in the background while you review and confirm earlier chunks, so it keeps working without waiting for you.
 
 **Permanent deletion**
-Flagged emails are marked `\Deleted` and `EXPUNGE`d — removed from the server, not moved to trash.
+Flagged emails are marked `\Deleted` and `EXPUNGE`d — removed from the server, not moved to trash. A fresh IMAP connection is opened for each deletion batch, so long classification runs don't cause connection timeouts.
 
 ## Progress tracking
 
-Processed emails are recorded in `processed_uids.json`. Subsequent runs automatically skip emails that have already been reviewed, so you can run incrementally without re-classifying the same emails.
+Processed emails are recorded in `processed_uids.json`. Subsequent runs automatically skip emails that have already been reviewed, so you can run incrementally without re-classifying the same emails. Pass 1 results are saved immediately; Pass 2 results are saved after each batch of 10, so progress is preserved even if the run is interrupted.
 
 ## Rate limits (free tier)
 
@@ -93,4 +98,4 @@ The script uses `gemma-3-27b-it` by default and falls back to `gemma-3-12b-it` w
 - 15,000 input tokens/minute
 - 14,400 requests/day
 
-The script waits automatically when rate-limited and retries up to 5 times per batch.
+The script waits automatically when rate-limited and retries up to 5 times per batch. When both models are exhausted, remaining emails default to `KEEP`.
