@@ -369,7 +369,7 @@ def classify_batch(client, model, batch):
     raise QuotaExhausted(f'{model} max retries exceeded')
 
 
-def classification_worker(client, candidates, result_queue, initial_processed):
+def classification_worker(client, candidates, result_queue, initial_processed, quiet):
     """Background thread: classifies emails and saves progress after every batch."""
     processed = {k: list(v) for k, v in initial_processed.items()}
     model_idx = 0
@@ -379,7 +379,8 @@ def classification_worker(client, candidates, result_queue, initial_processed):
 
     for idx, batch in enumerate(batches):
         model = AI_MODELS[model_idx % len(AI_MODELS)]
-        print(f'  [classifier] batch {idx + 1}/{total_batches} [{model}]')
+        if not quiet.is_set():
+            print(f'  [classifier] batch {idx + 1}/{total_batches} [{model}]')
 
         while True:
             try:
@@ -482,13 +483,18 @@ def build_chunk_report(chunk, chunk_num, now_str):
 # Deletion
 # ---------------------------------------------------------------------------
 
-def delete_emails(mail, to_delete):
+def delete_emails(to_delete, server, port, username, password):
     by_folder = {}
     for e in to_delete:
         by_folder.setdefault(e['folder'], []).append(e['uid'])
 
-    total = len(to_delete)
     deleted = 0
+
+    try:
+        mail = connect_imap(server, port, username, password)
+    except ConnectionError as e:
+        print(f'  Could not reconnect for deletion: {e}')
+        return
 
     for folder, uids in by_folder.items():
         try:
@@ -505,6 +511,11 @@ def delete_emails(mail, to_delete):
             print()
         except imaplib.IMAP4.error as e:
             print(f'\n  Error during deletion in "{folder}": {e}')
+
+    try:
+        mail.logout()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -607,7 +618,7 @@ def main():
         print('Pass 2: Starting AI classification in background...\n')
         worker = threading.Thread(
             target=classification_worker,
-            args=(client, pass2_candidates, result_queue, processed),
+            args=(client, pass2_candidates, result_queue, processed, quiet),
             daemon=True,
         )
         worker.start()
@@ -621,6 +632,7 @@ def main():
     worker_done = not bool(pass2_candidates)
     total_deleted = 0
     last_item_time = time.time()
+    quiet = threading.Event()
 
     while pass1_idx < len(pass1_flagged) or not worker_done:
         chunk = []
@@ -671,9 +683,11 @@ def main():
             print('  Nothing to delete in this chunk.')
             continue
 
+        quiet.set()
         answer = input(
             f'\nDelete {len(to_delete):,} emails permanently? (yes / no / quit): '
         ).strip().lower()
+        quiet.clear()
 
         if answer == 'quit':
             print('Stopping. Progress saved — remaining emails will be picked up next run.')
@@ -683,7 +697,7 @@ def main():
             return
         elif answer == 'yes':
             print(f'Deleting {len(to_delete):,} emails...')
-            delete_emails(mail, to_delete)
+            delete_emails(to_delete, server, port, username, password)
             total_deleted += len(to_delete)
             print(f'  Chunk {chunk_num} done. Running total: {total_deleted:,} deleted.')
         else:
