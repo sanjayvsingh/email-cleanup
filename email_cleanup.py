@@ -9,7 +9,9 @@ import getpass
 import imaplib
 import json
 import os
+import queue
 import re
+import threading
 import time
 from datetime import datetime
 from html.parser import HTMLParser
@@ -38,6 +40,8 @@ AI_BATCH_SIZE = 10
 AI_MODELS = ['gemma-3-27b-it', 'gemma-3-12b-it']
 BODY_MAX_CHARS = 500
 BATCH_DELAY = 10
+IMAP_FETCH_BATCH = 100
+INTERACTIVE_CHUNK_SIZE = 1000
 ENV_FILE = '.env'
 PROCESSED_UIDS_FILE = 'processed_uids.json'
 
@@ -83,6 +87,14 @@ def strip_html(html_text):
     return stripper.get_text()
 
 
+def _safe_decode(payload, charset):
+    """Decode bytes, falling back to latin-1 for unknown or invalid charsets."""
+    try:
+        return payload.decode(charset, errors='replace')
+    except (LookupError, UnicodeDecodeError):
+        return payload.decode('latin-1', errors='replace')
+
+
 def decode_header(value):
     if not value:
         return ''
@@ -90,7 +102,7 @@ def decode_header(value):
     decoded = []
     for part, charset in parts:
         if isinstance(part, bytes):
-            decoded.append(part.decode(charset or 'utf-8', errors='replace'))
+            decoded.append(_safe_decode(part, charset or 'utf-8'))
         else:
             decoded.append(part)
     return ''.join(decoded)
@@ -106,8 +118,7 @@ def get_body(msg):
             payload = part.get_payload(decode=True)
             if not payload:
                 continue
-            charset = part.get_content_charset() or 'utf-8'
-            text = payload.decode(charset, errors='replace')
+            text = _safe_decode(payload, part.get_content_charset() or 'utf-8')
             if ctype == 'text/plain':
                 body = text
                 break
@@ -116,14 +127,12 @@ def get_body(msg):
     else:
         payload = msg.get_payload(decode=True)
         if payload:
-            charset = msg.get_content_charset() or 'utf-8'
-            text = payload.decode(charset, errors='replace')
+            text = _safe_decode(payload, msg.get_content_charset() or 'utf-8')
             body = strip_html(text) if msg.get_content_type() == 'text/html' else text
     return body.strip()
 
 
 def imap_quote(folder):
-    """Quote IMAP folder name if it contains spaces."""
     return f'"{folder}"' if ' ' in folder else folder
 
 
@@ -151,9 +160,8 @@ def _save_env_values(new_values):
 
 
 def load_credentials():
-    # Read password from OS environment before load_dotenv so .env cannot shadow it
+    # Read password from OS env before load_dotenv so .env cannot shadow it
     password = os.environ.get('IMAP_PASSWORD', '').strip()
-
     load_dotenv(ENV_FILE)
     server = os.environ.get('IMAP_SERVER', '').strip()
     port_str = os.environ.get('IMAP_PORT', '').strip()
@@ -192,13 +200,27 @@ def connect_imap(server, port, username, password):
         raise ConnectionError(f'IMAP connection/login failed: {e}')
 
 
-def fetch_emails(mail, folder, limit=None, skip_uids=None):
-    """Fetch emails from a folder, skipping already-processed UIDs."""
+def get_folder_message_count(mail, folder):
+    """Return total message count via STATUS — does not select the folder."""
     try:
-        status, _ = mail.select(imap_quote(folder), readonly=True)
+        status, data = mail.status(imap_quote(folder), '(MESSAGES)')
+        if status == 'OK' and data:
+            m = re.search(rb'MESSAGES (\d+)', data[0])
+            if m:
+                return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def fetch_emails(mail, folder, limit=None, skip_uids=None):
+    """Fetch emails in IMAP batches, skipping already-processed UIDs."""
+    try:
+        status, data = mail.select(imap_quote(folder), readonly=True)
         if status != 'OK':
             print(f'  Folder "{folder}" not found — skipping.')
             return []
+        total_in_folder = int(data[0]) if data and data[0] else 0
     except imaplib.IMAP4.error as e:
         print(f'  Error selecting "{folder}": {e} — skipping.')
         return []
@@ -216,33 +238,48 @@ def fetch_emails(mail, folder, limit=None, skip_uids=None):
     if skip_uids:
         uids = [uid for uid in uids if uid.decode() not in skip_uids]
 
-    if limit is not None:
-        uids = uids[:limit]
+    fetch_count = min(limit, len(uids)) if limit is not None else len(uids)
+    uids = uids[:fetch_count]
 
-    print(f'  Fetching {len(uids)} unprocessed emails from "{folder}"...')
+    print(f'  {total_in_folder:,} total  |  {fetch_count:,} unprocessed to fetch')
+
     results = []
-    for uid in uids:
+    for i in range(0, len(uids), IMAP_FETCH_BATCH):
+        batch_uids = uids[i:i + IMAP_FETCH_BATCH]
+        uid_list = b','.join(batch_uids)
         try:
-            status, msg_data = mail.uid('fetch', uid, '(RFC822)')
-            if status != 'OK' or not msg_data or not msg_data[0]:
+            status, msg_data = mail.uid('fetch', uid_list, '(UID RFC822)')
+            if status != 'OK' or not msg_data:
                 continue
-            raw = msg_data[0][1]
-            msg = email_lib.message_from_bytes(raw)
+            for item in msg_data:
+                if not isinstance(item, tuple) or len(item) < 2 or not isinstance(item[1], bytes):
+                    continue
+                header_bytes, raw = item[0], item[1]
+                try:
+                    uid_match = re.search(rb'\bUID\s+(\d+)', header_bytes)
+                    uid = uid_match.group(1) if uid_match else None
+                    if uid is None:
+                        continue
+                    msg = email_lib.message_from_bytes(raw)
+                    sender_full = decode_header(msg.get('From', ''))
+                    name, addr = email.utils.parseaddr(sender_full)
+                    results.append({
+                        'uid': uid,
+                        'msg': msg,
+                        'date': decode_header(msg.get('Date', '')),
+                        'sender_addr': addr.lower().strip(),
+                        'sender_name': name,
+                        'subject': decode_header(msg.get('Subject', '(no subject)')),
+                        'folder': folder,
+                    })
+                except Exception as e:
+                    print(f'  Warning: skipping a message: {e}')
+        except imaplib.IMAP4.error as e:
+            print(f'  Warning: batch fetch error at offset {i}: {e}')
 
-            sender_full = decode_header(msg.get('From', ''))
-            name, addr = email.utils.parseaddr(sender_full)
-
-            results.append({
-                'uid': uid,
-                'msg': msg,
-                'date': decode_header(msg.get('Date', '')),
-                'sender_addr': addr.lower().strip(),
-                'sender_name': name,
-                'subject': decode_header(msg.get('Subject', '(no subject)')),
-                'folder': folder,
-            })
-        except Exception as e:
-            print(f'  Warning: skipping uid {uid}: {e}')
+        fetched = min(i + IMAP_FETCH_BATCH, len(uids))
+        if fetched % 500 == 0 or fetched == len(uids):
+            print(f'  ...{fetched:,} of {fetch_count:,} fetched')
 
     return results
 
@@ -256,17 +293,15 @@ def pass1_check(entry):
     for prefix in PASS1_SENDER_PREFIXES:
         if local.startswith(prefix):
             return f'sender prefix: {prefix}'
-
     subject_lower = entry['subject'].lower()
     for phrase in PASS1_SUBJECT_PHRASES:
         if phrase in subject_lower:
             return f'subject phrase: "{phrase}"'
-
     return None
 
 
 # ---------------------------------------------------------------------------
-# Pass 2 — AI classification
+# Pass 2 — AI classification (background thread)
 # ---------------------------------------------------------------------------
 
 def _format_batch_prompt(batch):
@@ -289,8 +324,10 @@ def _format_batch_prompt(batch):
         "SPAM = phishing, scams, fraud, fake prizes, impersonation, suspicious links, malware.\n"
         "KEEP = personal correspondence, security alerts, password resets, account notices, "
         "and ORDER CONFIRMATIONS that serve as a receipt (contain an order number, itemised "
-        "purchase, or payment confirmation). Shipping notifications and review requests are NOT receipts — classify those as MARKETING.\n\n"
-        "When uncertain, always classify as KEEP — it is better to keep an email than to delete something important.\n\n"
+        "purchase, or payment confirmation). Shipping notifications and review requests are NOT "
+        "receipts — classify those as MARKETING.\n\n"
+        "When uncertain, always classify as KEEP — it is better to keep an email than to delete "
+        "something important.\n\n"
         "Respond with exactly one line per email:\n"
         "Email N: MARKETING|SPAM|KEEP — <one-line reason>\n\n"
         + '\n\n'.join(items)
@@ -301,11 +338,16 @@ def classify_batch(client, model, batch):
     max_retries = 5
     for attempt in range(max_retries):
         try:
-            response = client.models.generate_content(model=model, contents=_format_batch_prompt(batch))
+            response = client.models.generate_content(
+                model=model, contents=_format_batch_prompt(batch)
+            )
             text = response.text
             results = []
             for i in range(len(batch)):
-                m = re.search(rf'Email {i + 1}:\s*(MARKETING|SPAM|KEEP)\s*[—\-–]\s*(.+)', text, re.IGNORECASE)
+                m = re.search(
+                    rf'Email {i + 1}:\s*(MARKETING|SPAM|KEEP)\s*[—\-–]\s*(.+)',
+                    text, re.IGNORECASE
+                )
                 if m:
                     results.append((m.group(1).upper(), m.group(2).strip()))
                 else:
@@ -317,24 +359,27 @@ def classify_batch(client, model, batch):
                 if attempt < max_retries - 1:
                     delay_match = re.search(r'retryDelay[^\d]*(\d+)s', err_str)
                     wait = int(delay_match.group(1)) + 5 if delay_match else 65
-                    print(f'  Rate limit on {model} — waiting {wait}s then retrying (attempt {attempt + 1}/{max_retries})...')
+                    print(f'\n  Rate limit on {model} — waiting {wait}s '
+                          f'(attempt {attempt + 1}/{max_retries})...')
                     time.sleep(wait)
                     continue
                 raise QuotaExhausted(f'{model} quota exhausted after {max_retries} retries')
-            print(f'  API batch error: {e} — skipping batch, all defaulting to KEEP')
+            print(f'\n  API batch error: {e} — skipping batch, defaulting to KEEP')
             return [('KEEP', f'API error: {e}')] * len(batch)
     raise QuotaExhausted(f'{model} max retries exceeded')
 
 
-def pass2_classify(client, candidates):
-    batches = [candidates[i:i + AI_BATCH_SIZE] for i in range(0, len(candidates), AI_BATCH_SIZE)]
-    results = []
+def classification_worker(client, candidates, result_queue, initial_processed):
+    """Background thread: classifies emails and saves progress after every batch."""
+    processed = {k: list(v) for k, v in initial_processed.items()}
     model_idx = 0
     consecutive_failures = 0
+    batches = [candidates[i:i + AI_BATCH_SIZE] for i in range(0, len(candidates), AI_BATCH_SIZE)]
+    total_batches = len(batches)
 
     for idx, batch in enumerate(batches):
         model = AI_MODELS[model_idx % len(AI_MODELS)]
-        print(f'  AI classifying batch {idx + 1}/{len(batches)} ({len(batch)} emails) [{model}]...')
+        print(f'  [classifier] batch {idx + 1}/{total_batches} [{model}]')
 
         while True:
             try:
@@ -344,13 +389,14 @@ def pass2_classify(client, candidates):
             except QuotaExhausted:
                 consecutive_failures += 1
                 if consecutive_failures >= len(AI_MODELS):
-                    print('  All models quota exhausted — defaulting remaining emails to KEEP.')
-                    for remaining in batches[idx:]:
-                        for entry in remaining:
+                    print('\n  All models quota exhausted — remaining emails default to KEEP.')
+                    for remaining_batch in batches[idx:]:
+                        for entry in remaining_batch:
                             entry['classification'] = 'KEEP'
                             entry['reason'] = 'all models quota exhausted'
-                            results.append(entry)
-                    return results
+                            result_queue.put(entry)
+                    result_queue.put(None)
+                    return
                 model_idx = (model_idx + 1) % len(AI_MODELS)
                 model = AI_MODELS[model_idx]
                 print(f'  Switching to {model}...')
@@ -358,47 +404,41 @@ def pass2_classify(client, candidates):
         for entry, (classification, reason) in zip(batch, classifications):
             entry['classification'] = classification
             entry['reason'] = reason
-            results.append(entry)
+            result_queue.put(entry)
+            uid_str = entry['uid'].decode() if isinstance(entry['uid'], bytes) else str(entry['uid'])
+            processed.setdefault(entry['folder'], [])
+            if uid_str not in processed[entry['folder']]:
+                processed[entry['folder']].append(uid_str)
 
-        if idx < len(batches) - 1:
+        save_processed_uids(processed)
+
+        if idx < total_batches - 1:
             time.sleep(BATCH_DELAY)
 
-    return results
+    result_queue.put(None)
 
 
 # ---------------------------------------------------------------------------
-# Preview report
+# Report (per chunk)
 # ---------------------------------------------------------------------------
 
-def build_report(pass1_flagged, pass2_results, all_counts, now_str, folders=None):
-    if folders is None:
-        folders = TARGET_FOLDERS
-    p2_marketing = [e for e in pass2_results if e['classification'] == 'MARKETING']
-    p2_spam = [e for e in pass2_results if e['classification'] == 'SPAM']
-    p2_to_delete = p2_marketing + p2_spam
-    total_flagged = len(pass1_flagged) + len(p2_to_delete)
-    total_emails = sum(all_counts.values())
+def build_chunk_report(chunk, chunk_num, now_str):
+    p1 = [e for e in chunk if e.get('pass') == 1]
+    p2_marketing = [e for e in chunk if e.get('pass') == 2 and e['classification'] == 'MARKETING']
+    p2_spam = [e for e in chunk if e.get('pass') == 2 and e['classification'] == 'SPAM']
+    to_delete = p1 + p2_marketing + p2_spam
 
     lines = [
-        'Email Cleanup Preview Report',
+        f'Email Cleanup — Chunk {chunk_num}',
         f'Generated: {now_str}',
         f'Account:   {os.environ.get("IMAP_USERNAME", "unknown")}',
-        '',
-    ]
-
-    for folder in folders:
-        f_p1 = sum(1 for e in pass1_flagged if e['folder'] == folder)
-        f_p2 = sum(1 for e in p2_to_delete if e['folder'] == folder)
-        lines.append(f'{folder + ":":<22} deleting {f_p1 + f_p2:,} of {all_counts.get(folder, 0):,} emails')
-
-    lines += [
-        f'{"Total:":<22} deleting {total_flagged:,} of {total_emails:,} emails',
+        f'Reviewed: {len(chunk):,}   Flagged: {len(to_delete):,}',
         '',
         '=' * 64,
-        f'PASS 1 — Keyword Matches ({len(pass1_flagged)} emails)',
+        f'PASS 1 — Keyword Matches ({len(p1)} emails)',
         '=' * 64,
     ]
-    for e in pass1_flagged:
+    for e in p1:
         lines += [
             f'  [{e["folder"]}] {e["date"]}',
             f'  From:    {e["sender_name"]} <{e["sender_addr"]}>',
@@ -435,7 +475,7 @@ def build_report(pass1_flagged, pass2_results, all_counts, now_str, folders=None
             '',
         ]
 
-    return '\n'.join(lines), total_flagged, p2_to_delete
+    return '\n'.join(lines), to_delete
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +494,7 @@ def delete_emails(mail, to_delete):
         try:
             status, _ = mail.select(imap_quote(folder))
             if status != 'OK':
-                print(f'  Could not select "{folder}" for deletion — skipping {len(uids)} emails.')
+                print(f'  Could not select "{folder}" — skipping {len(uids)} emails.')
                 continue
             for uid in uids:
                 deleted += 1
@@ -475,9 +515,11 @@ def main():
     load_dotenv(ENV_FILE)
 
     parser = argparse.ArgumentParser(description='Email cleanup tool')
-    parser.add_argument('folder', nargs='?', help='Folder to scan (omit to scan all target folders)')
-    parser.add_argument('--list-folders', action='store_true', help='List available IMAP folders and exit')
-    parser.add_argument('--limit', type=int, default=100, help='Max unprocessed emails to fetch per folder (default: 100)')
+    parser.add_argument('folder', nargs='?', help='IMAP folder to scan')
+    parser.add_argument('--list-folders', action='store_true',
+                        help='List available folders with message counts and exit')
+    parser.add_argument('--limit', type=int, default=100,
+                        help='Max unprocessed emails to fetch (default: 100)')
     args = parser.parse_args()
 
     api_key = os.environ.get('GOOGLE_API_KEY')
@@ -499,13 +541,23 @@ def main():
 
     if not args.folder and not args.list_folders:
         parser.print_help()
+        mail.logout()
         return
 
     if args.list_folders:
-        print('Available folders:')
+        print(f'{"Messages":>10}  Folder')
+        print('-' * 40)
         _, folder_list = mail.list()
         for item in folder_list or []:
-            print(' ', item.decode(errors='replace'))
+            decoded = item.decode(errors='replace')
+            m = re.match(r'\([^)]*\)\s+"[^"]*"\s+"?(.+?)"?\s*$', decoded)
+            if m:
+                fname = m.group(1).strip()
+                count = get_folder_message_count(mail, fname)
+                count_str = f'{count:>10,}' if count is not None else f'{"?":>10}'
+                print(f'{count_str}  {fname}')
+            else:
+                print(f'{"?":>10}  {decoded}')
         mail.logout()
         return
 
@@ -514,12 +566,10 @@ def main():
 
     # Fetch
     all_emails = []
-    all_counts = {folder: 0 for folder in folders_to_scan}
     for folder in folders_to_scan:
         print(f'Scanning folder: {folder}')
         skip = set(processed.get(folder, []))
         emails = fetch_emails(mail, folder, limit=args.limit, skip_uids=skip)
-        all_counts[folder] = len(emails)
         all_emails.extend(emails)
         print()
 
@@ -535,62 +585,115 @@ def main():
         reason = pass1_check(e)
         if reason:
             e['reason'] = reason
+            e['pass'] = 1
             pass1_flagged.append(e)
         else:
             pass2_candidates.append(e)
-    print(f'  Flagged: {len(pass1_flagged)}   Candidates for AI: {len(pass2_candidates)}\n')
+    print(f'  Keyword flagged: {len(pass1_flagged):,}   AI candidates: {len(pass2_candidates):,}\n')
 
-    # Pass 2
-    client = genai.Client(api_key=api_key)
-    pass2_results = []
-    if pass2_candidates:
-        print('Pass 2: AI classification...')
-        pass2_results = pass2_classify(client, pass2_candidates)
-        ai_flagged = sum(1 for e in pass2_results if e['classification'] in ('MARKETING', 'SPAM'))
-        print(f'  AI flagged: {ai_flagged} additional emails\n')
-
-    # Report
-    now = datetime.now()
-    report_text, total_flagged, p2_to_delete = build_report(
-        pass1_flagged, pass2_results, all_counts, now.strftime('%Y-%m-%d %H:%M:%S'),
-        folders=folders_to_scan,
-    )
-    report_file = f'email_cleanup_preview_{now.strftime("%Y%m%d_%H%M%S")}.txt'
-    with open(report_file, 'w', encoding='utf-8') as f:
-        f.write(report_text)
-    print(f'Preview report saved to: {report_file}\n')
-
-    # Print summary
-    for folder in folders_to_scan:
-        f_p1 = sum(1 for e in pass1_flagged if e['folder'] == folder)
-        f_p2 = sum(1 for e in p2_to_delete if e['folder'] == folder)
-        print(f'{folder + ":":<22} deleting {f_p1 + f_p2:,} of {all_counts.get(folder, 0):,} emails')
-    total_emails = sum(all_counts.values())
-    print(f'{"Total:":<22} deleting {total_flagged:,} of {total_emails:,} emails\n')
-
-    if total_flagged == 0:
-        print('Nothing to delete. Exiting.')
-        mail.logout()
-        return
-
-    # Mark all reviewed emails as processed so they are skipped on future runs
-    for e in all_emails:
+    # Save pass1 UIDs immediately — they're fully processed regardless of deletion outcome
+    for e in pass1_flagged:
         uid_str = e['uid'].decode() if isinstance(e['uid'], bytes) else str(e['uid'])
         processed.setdefault(e['folder'], [])
         if uid_str not in processed[e['folder']]:
             processed[e['folder']].append(uid_str)
     save_processed_uids(processed)
 
-    answer = input(f'Delete {total_flagged} emails permanently? This cannot be undone. (yes/no): ').strip()
-    if answer != 'yes':
-        print('Cancelled. No emails were deleted.')
-        mail.logout()
-        return
+    # Start background classifier
+    result_queue = queue.Queue()
+    client = genai.Client(api_key=api_key)
 
-    to_delete = pass1_flagged + p2_to_delete
-    print(f'\nDeleting {total_flagged} emails...')
-    delete_emails(mail, to_delete)
-    print(f'\nDone. {total_flagged} emails permanently deleted.')
+    if pass2_candidates:
+        print('Pass 2: Starting AI classification in background...\n')
+        worker = threading.Thread(
+            target=classification_worker,
+            args=(client, pass2_candidates, result_queue, processed),
+            daemon=True,
+        )
+        worker.start()
+    else:
+        result_queue.put(None)
+        worker = None
+
+    # Interactive chunk loop
+    pass1_idx = 0
+    chunk_num = 0
+    worker_done = not bool(pass2_candidates)
+    total_deleted = 0
+    last_item_time = time.time()
+
+    while pass1_idx < len(pass1_flagged) or not worker_done:
+        chunk = []
+
+        # Fill from pass1 first
+        while pass1_idx < len(pass1_flagged) and len(chunk) < INTERACTIVE_CHUNK_SIZE:
+            chunk.append(pass1_flagged[pass1_idx])
+            pass1_idx += 1
+
+        # Fill remainder from AI queue
+        while len(chunk) < INTERACTIVE_CHUNK_SIZE and not worker_done:
+            try:
+                item = result_queue.get(timeout=2)
+                if item is None:
+                    worker_done = True
+                else:
+                    item['pass'] = 2
+                    chunk.append(item)
+                    last_item_time = time.time()
+            except queue.Empty:
+                # If we have items and the worker has been quiet for >60s
+                # (e.g. waiting out a rate-limit retry), present what we have
+                if chunk and (time.time() - last_item_time) > 60:
+                    break
+
+        if not chunk:
+            break
+
+        chunk_num += 1
+        now = datetime.now()
+        report_text, to_delete = build_chunk_report(
+            chunk, chunk_num, now.strftime('%Y-%m-%d %H:%M:%S')
+        )
+
+        report_file = f'email_cleanup_preview_{now.strftime("%Y%m%d_%H%M%S")}_chunk{chunk_num}.txt'
+        with open(report_file, 'w', encoding='utf-8') as f:
+            f.write(report_text)
+
+        print(f'\n{"=" * 64}')
+        print(f'Chunk {chunk_num} ready — {len(chunk):,} emails reviewed')
+        print(f'  Keyword flagged:  {sum(1 for e in chunk if e.get("pass") == 1):,}')
+        print(f'  AI marketing:     {sum(1 for e in chunk if e.get("pass") == 2 and e["classification"] == "MARKETING"):,}')
+        print(f'  AI spam:          {sum(1 for e in chunk if e.get("pass") == 2 and e["classification"] == "SPAM"):,}')
+        print(f'  Flagged total:    {len(to_delete):,}')
+        print(f'  Report saved to:  {report_file}')
+
+        if not to_delete:
+            print('  Nothing to delete in this chunk.')
+            continue
+
+        answer = input(
+            f'\nDelete {len(to_delete):,} emails permanently? (yes / no / quit): '
+        ).strip().lower()
+
+        if answer == 'quit':
+            print('Stopping. Progress saved — remaining emails will be picked up next run.')
+            if worker:
+                worker.join(timeout=2)
+            mail.logout()
+            return
+        elif answer == 'yes':
+            print(f'Deleting {len(to_delete):,} emails...')
+            delete_emails(mail, to_delete)
+            total_deleted += len(to_delete)
+            print(f'  Chunk {chunk_num} done. Running total: {total_deleted:,} deleted.')
+        else:
+            print('  Skipped — no emails deleted for this chunk.')
+
+    if worker:
+        worker.join(timeout=5)
+
+    print(f'\n{"=" * 64}')
+    print(f'All done. {total_deleted:,} emails permanently deleted.')
     mail.logout()
 
 
